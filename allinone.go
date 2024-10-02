@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha1"
 	"encoding/base64"
@@ -27,7 +28,7 @@ func main() {
 	noGorilla := true
 	socketPath := "/tmp/test.sock"
 
-	go serverMain(socketPath, noGorilla)
+	go serverMain(socketPath, !noGorilla)
 
 	go func() {
 		<-time.After(3 * time.Second)
@@ -58,9 +59,13 @@ type contextKey struct {
 }
 
 var ConnContextKey = &contextKey{"http-conn"}
+var ConnContextCancelKey = &contextKey{"http-conn-cancel"}
 
 func saveConnInContext(ctx context.Context, c net.Conn) context.Context {
-	return context.WithValue(ctx, ConnContextKey, c)
+	ctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	ctx = context.WithValue(ctx, ConnContextKey, c)
+	ctx = context.WithValue(ctx, ConnContextCancelKey, cancel)
+	return ctx
 }
 
 func getHttpConn(r *http.Request) *net.UnixConn {
@@ -79,12 +84,15 @@ func computeAcceptKey(challengeKey string) string {
 }
 
 func serverMain(socketPath string, useGorilla bool) {
+	_ = os.Remove(socketPath)
+
 	srv := &server{
 		useGorilla: useGorilla,
 	}
 
 	hSrv := http.Server{
 		Handler:     srv,
+		ReadTimeout: 100 * time.Millisecond,
 		ConnContext: saveConnInContext,
 	}
 
@@ -179,22 +187,54 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Use manual WebSocket upgrade
 		log.Println("Hijacking connection")
 
-		// It looks like switching to one or the other of these two lines sometimes gets us past the deadlock,
-		// although it's inconsistent. This suggests there might be a race condition somewhere.
-		conn, rw, err := http.NewResponseController(w).Hijack()
-		//conn, rw, err := w.(http.Hijacker).Hijack()
-
+		// Steal the file descriptor first
+		connFile, err := conn.File()
 		if err != nil {
-			log.Printf("Error hijacking connection: %v", err)
+			log.Printf("Error getting file descriptor: %v", err)
 			return
 		}
-		log.Println("Connection hijacked")
+		log.Println("Duping file descriptor")
+		connFd := int(connFile.Fd())
+		newFd, err := syscall.Dup(connFd)
+		if err != nil {
+			log.Printf("Error duplicating file descriptor: %v", err)
+			return
+		}
+		log.Println("Duplicated file descriptor")
+
+		defused := false
+		go func() {
+			<-time.After(100 * time.Millisecond)
+			if !defused {
+				log.Println("Forcefully closing hijacked socket")
+				err := syscall.Close(connFd)
+				if err != nil {
+					log.Printf("Error closing hijacked socket: %v", err)
+				}
+				log.Println("Hijacked socket closed")
+			}
+		}()
+		go func() {
+			_, _, _ = http.NewResponseController(w).Hijack()
+			defused = true
+			log.Println("Connection hijacked")
+		}()
+		//conn, rw, err := w.(http.Hijacker).Hijack()
+
+		conn, err := net.FileConn(os.NewFile(uintptr(newFd), ""))
+		if err != nil {
+			log.Printf("Failed to create new connection: %v", err)
+			return
+		}
+		log.Println("Connection created")
 		defer func(conn net.Conn) {
 			err := conn.Close()
 			if err != nil {
 				log.Printf("Error closing connection: %v", err)
 			}
 		}(conn)
+
+		rw := bufio.NewReadWriter(bufio.NewReader(conn), bufio.NewWriter(conn))
 
 		// Write status line
 		challengeKey := r.Header.Get("Sec-WebSocket-Key")
