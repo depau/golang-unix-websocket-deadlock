@@ -164,6 +164,9 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// Use manual WebSocket upgrade
 		log.Println("Hijacking connection")
 		go dumpGoroutinesAfter(3)
+
+		// It looks like switching to one or the other of these two lines sometimes gets us past the deadlock,
+		// although it's inconsistent. This suggests there might be a race condition somewhere.
 		conn, rw, err := http.NewResponseController(w).Hijack()
 		//conn, rw, err := w.(http.Hijacker).Hijack()
 
