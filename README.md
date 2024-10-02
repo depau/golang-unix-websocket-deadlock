@@ -7,23 +7,23 @@ This is a reproducer for a deadlock that happens when using a WebSocket server o
 Build both the client and the server:
 
 ```sh
-go build -o server ./cmd/server
-go build -o client ./cmd/client
+go build -C ./cmd/server
+go build -C ./cmd/client
 ```
 
 Run the server:
 
 ```sh
-./server /tmp/wsunix.sock
+./cmd/server/server /tmp/wsunix.sock
 ```
 
 Run the client:
 
 ```sh
-./client /tmp/wsunix.sock
+./cmd/client/client /tmp/wsunix.sock
 ```
 
-Observe how the server hangs when it tries to hijack the HTTP connection.
+Re-run the client until the server freezes when upgrading to WebSocket.
 
 Both the client and the server use Gorilla WebSocket, although I additionally implemented a simple WebSocket to
 demonstrate that the issue is likely not caused by Gorilla WebSocket.
@@ -31,8 +31,10 @@ demonstrate that the issue is likely not caused by Gorilla WebSocket.
 To run the server without Gorilla WebSocket, use the `--no-gorilla` flag:
 
 ```sh
-./server /tmp/wsunix.sock --no-gorilla
+./cmd/server/server /tmp/wsunix.sock --no-gorilla
 ```
+
+In this mode it will occasionally freeze when hijacking the connection.
 
 The culprit seems to be this stack trace where `net/http.(*conn).hijackLocked` tries to abort the background read
 goroutine but the goroutine's syscall is never interrupted:
